@@ -14,7 +14,7 @@ SIZE = (720, 720)
 DOT_COLOR = (0, 255, 0)
 GRID_COLOR = (40, 40, 0)
 BG_COLOR = (16, 16, 16)
-FPS = int(input("FPS> "))
+FPS = 87
 
 _ = tk.Tk()
 _.geometry("1x1+512+512")
@@ -28,7 +28,7 @@ except wave.Error as e:
     print(f"出错: {e}")
     exit()
 sample_rate = wro.getframerate()
-read_length = int(wro.getframerate() / FPS)
+READ_LENGTH = int(wro.getframerate() / FPS)
 
 pygame.init()
 
@@ -77,10 +77,10 @@ try:
 
         latency = pygame.mixer.music.get_pos() - wro.tell() * 1000 / sample_rate
         fps = 1 / (1 / FPS - max(min(latency / 15000, 0.00075), -0.00075))
-        read_length = int(wro.getframerate() / FPS)
+        READ_LENGTH = int(wro.getframerate() / FPS)
         if abs(latency) > 64:  # latency correction
             wro.setpos(pygame.mixer.music.get_pos() * sample_rate // 1000)
-        frames = wro.readframes(read_length)
+        frames = wro.readframes(READ_LENGTH)
 
         pygame.surfarray.blit_array(screen, grid)
 
