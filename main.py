@@ -1,6 +1,6 @@
 import os
 import re
-import subprocess
+from subprocess import Popen, DEVNULL, PIPE
 
 import numpy as np
 import pygame
@@ -18,31 +18,21 @@ audio_file = r"24.wav"
 
 
 class FFMPEG_AudioReader:
-    def __init__(self, filename, buffersize, fps=44100):
+    def __init__(self, filename, buffersize):
         self.filename = filename
-        self.nbytes = 4
-        self.fps = fps
-        self.format = "s32le"
-        self.codec = "pcm_s32le"
 
         cmd = ["ffmpeg", "-hide_banner", "-i", filename]
+        popen_params = {"bufsize": 10 ** 5, "stdout": PIPE,
+                        "stderr": PIPE, "stdin": DEVNULL}
 
-        popen_params = {
-            "bufsize": 10 ** 5,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "stdin": subprocess.DEVNULL,
-        }
-
-        proc = subprocess.Popen(cmd, **popen_params)
-        (output, error) = proc.communicate()
+        proc = Popen(cmd, **popen_params)
 
         self.duration = 0
-        self.sample_rate = "unknown"
-        for line in error.decode("utf8", errors="ignore").splitlines()[1:]:
+        self.sample_rate = 48000
+        for line in proc.communicate()[1].decode("utf8", errors="ignore").splitlines()[1:]:
             if line.startswith("  Duration:"):
                 time_raw_string = line.split("Duration: ")[-1]
-                match_duration = re.search(r"([0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9])", time_raw_string)
+                match_duration = re.search(r"(\d\d:\d\d:\d\d.\d\d)", time_raw_string)
                 time = match_duration.group(1)
                 if isinstance(time, str):
                     time = [float(part.replace(",", ".")) for part in time.split(":")]
@@ -56,107 +46,70 @@ class FFMPEG_AudioReader:
         proc.terminate()
         del proc
 
-        self.buffersize = min(int(self.fps * self.duration) + 1, buffersize)
+        self.bufsize = max(int(self.sample_rate * self.duration) + 1, buffersize)
         self.buffer = None
-        self.buffer_startframe = 1
+        self.buffer_start_frame = 1
         cmd = ["ffmpeg",
                "-i", self.filename,
                "-vn",
                "-loglevel", "error",
-               "-f", self.format,
-               "-c:a", self.codec,
-               "-ar", f"{self.fps:d}",
+               "-f", "s32le",
+               "-c:a", "pcm_s32le",
+               "-ar", f"{self.sample_rate:d}",
                "-ac", "2",
                "-"]
-        popen_params = {"bufsize": self.buffersize, "stdout": subprocess.PIPE,
-                        "stderr": subprocess.PIPE, "stdin": subprocess.DEVNULL, }
+        popen_params = {"bufsize": self.bufsize, "stdout": PIPE,
+                        "stderr": PIPE, "stdin": DEVNULL, }
 
-        self.proc = subprocess.Popen(cmd, **popen_params)
+        self.proc = Popen(cmd, **popen_params)
 
         self.pos = 0
         self.buffer_around(1)
 
-    def read_chunk(self, chunksize):
-        chunksize = int(round(chunksize))
-        s = self.proc.stdout.read(2 * chunksize * self.nbytes)
-        data_type = {1: "int8", 2: "int16", 4: "int32"}[self.nbytes]
-        result = np.frombuffer(s, dtype=data_type)
-        result = ((1.0 * result / 2 ** (8 * self.nbytes - 1))
-                  .reshape((int(len(result) / 2), 2)))
-
-        pad = np.zeros((chunksize - len(result), 2), dtype=result.dtype)
-        result = np.concatenate((result, pad))
-        self.pos = self.pos + chunksize
-        return result
-
-    def get_frame(self, tt):
-        in_time = (tt >= 0) & (tt < self.duration)
-
-        frames = np.round((self.fps * tt)).astype(int)[in_time]
-        fr_min, fr_max = frames.min(), frames.max()
-
-        if not (0 <= (fr_max - self.buffer_startframe) < len(self.buffer)):
-            self.buffer_around(fr_max)
-
-        result = np.zeros((len(tt), 2))
-        indices = frames - self.buffer_startframe
-        try:
-            result[in_time] = self.buffer[indices]
-            return result
-        except IndexError:
-            indices[indices >= len(self.buffer)] = len(self.buffer) - 1
-            result[in_time] = self.buffer[indices]
-            return result
-
     def buffer_around(self, frame_number):
-        new_bufferstart = max(0, frame_number - self.buffersize // 2)
+        new_buffer_start = max(0, frame_number - self.bufsize // 2)
 
-        if self.buffer is not None:
-            current_f_end = self.buffer_startframe + self.buffersize
-            conserved = current_f_end - new_bufferstart
-            chunksize = self.buffersize - conserved
-            array = self.read_chunk(chunksize)
-            self.buffer = np.vstack([self.buffer[-conserved:], array])
-        else:
-            self.pos = new_bufferstart
-            self.buffer = self.read_chunk(self.buffersize)
+        self.pos = new_buffer_start
 
-        self.buffer_startframe = new_bufferstart
+        chunk_size = int(round(self.bufsize))
+        s = self.proc.stdout.read(chunk_size * 8)
+        result = (np.frombuffer(s, dtype=np.int32) / 2147483648).reshape((-1, 2))
 
-    def __del__(self):
-        if self.proc:
-            if self.proc.poll() is None:
-                self.proc.terminate()
-                self.proc.stdout.close()
-                self.proc.stderr.close()
-                self.proc.wait()
-            self.proc = None
+        pad = np.zeros((chunk_size - len(result), 2), dtype=result.dtype)
+        self.buffer = np.concatenate((result, pad))
+        self.pos += chunk_size
+
+        self.buffer_start_frame = new_buffer_start
 
 
 class AudioFileClip:
-    def __init__(self, filename, fps=48000):
-        self.reader = FFMPEG_AudioReader(filename, buffersize=20_0000, fps=fps)
-        self.fps = fps
+    def __init__(self, filename):
+        self.reader = FFMPEG_AudioReader(filename, buffersize=96000)
+        self.sample_rate = self.reader.sample_rate
 
-    def iter_chunks(self, chunksize=None, quantize=False):
-        total_size = int(self.fps * self.reader.duration)
+    def iter_chunks(self, chunk_size=None, quantize=False):
+        total_size = int(self.sample_rate * self.reader.duration)
 
-        nchunks = total_size // chunksize + 1
+        nchunks = total_size // chunk_size + 1
 
         positions = np.linspace(0, total_size, nchunks + 1, endpoint=True, dtype=int)
 
         for i in range(nchunks):
-            timings = (1.0 / self.fps) * np.arange(positions[i], positions[i + 1])
-            yield self.to_soundarray(timings, quantize=quantize, buffersize=chunksize)
+            timings = (1.0 / self.sample_rate) * np.arange(positions[i], positions[i + 1])
+            yield self.to_soundarray(timings, quantize=quantize, buffer_size=chunk_size)
 
-    def to_soundarray(self, tt=None, quantize=False, buffersize=50000):
+    def to_soundarray(self, tt=None, quantize=False, buffer_size=96000):
         if tt is None:
-            max_duration = 1 * buffersize / self.fps
+            max_duration = 1 * buffer_size / self.sample_rate
             if self.reader.duration > max_duration:
-                return np.vstack(tuple(self.iter_chunks(chunksize=buffersize, quantize=quantize)))
-        snd_array = self.reader.get_frame(tt)
+                return np.vstack(tuple(self.iter_chunks(chunk_size=buffer_size, quantize=quantize)))
 
-        return snd_array
+        in_time = (tt >= 0) & (tt < self.reader.duration)
+
+        result = np.zeros((len(tt), 2))
+        indices = np.round((self.sample_rate * tt)).astype(int)[in_time] - self.reader.buffer_start_frame
+        result[in_time] = self.reader.buffer[indices]
+        return result
 
 
 def get_grid(size) -> np.ndarray:
@@ -181,10 +134,11 @@ def get_grid(size) -> np.ndarray:
 
 
 file = AudioFileClip(audio_file)
-sr = file.fps
+sr = file.sample_rate
 audio = file.to_soundarray()
 
-READ_LENGTH = 1024
+READ_TIME = 20  # milliseconds
+READ_LENGTH = int(READ_TIME / 1000 * sr)
 
 pygame.init()
 
